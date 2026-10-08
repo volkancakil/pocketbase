@@ -5,11 +5,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/json"
+	"encoding/json/v2"
 	"encoding/pem"
 	"testing"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/pocketbase/pocketbase/forms"
 	"github.com/pocketbase/pocketbase/tests"
 )

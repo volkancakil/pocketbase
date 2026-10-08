@@ -12,10 +12,34 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/labstack/echo/v5"
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/pocketbase/pocketbase/tools/filesystem"
 )
+
+func TestFileAsMap(t *testing.T) {
+	file, err := filesystem.NewFileFromBytes([]byte("test"), "test123.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := file.AsMap()
+
+	if len(result) != 3 {
+		t.Fatalf("Expected map with %d keys, got\n%v", 3, result)
+	}
+
+	if result["size"] != int64(4) {
+		t.Fatalf("Expected size %d, got %#v", 4, result["size"])
+	}
+
+	if str, ok := result["name"].(string); !ok || !strings.HasPrefix(str, "test123") {
+		t.Fatalf("Expected name to have prefix %q, got %#v", "test123", result["name"])
+	}
+
+	if result["originalName"] != "test123.txt" {
+		t.Fatalf("Expected originalName %q, got %#v", "test123.txt", result["originalName"])
+	}
+}
 
 func TestNewFileFromPath(t *testing.T) {
 	testDir := createTestDir(t)
@@ -28,8 +52,8 @@ func TestNewFileFromPath(t *testing.T) {
 	}
 
 	// existing file
-	originalName := "image_! noext"
-	normalizedNamePattern := regexp.QuoteMeta("image_noext_") + `\w{10}` + regexp.QuoteMeta(".png")
+	originalName := "image_!@ special"
+	normalizedNamePattern := regexp.QuoteMeta("image_special_") + `\w{10}` + regexp.QuoteMeta(".png")
 	f, err := filesystem.NewFileFromPath(filepath.Join(testDir, originalName))
 	if err != nil {
 		t.Fatalf("Expected nil error, got %v", err)
@@ -40,8 +64,8 @@ func TestNewFileFromPath(t *testing.T) {
 	if match, err := regexp.Match(normalizedNamePattern, []byte(f.Name)); !match {
 		t.Fatalf("Expected Name to match %v, got %q (%v)", normalizedNamePattern, f.Name, err)
 	}
-	if f.Size != 73 {
-		t.Fatalf("Expected Size %v, got %v", 73, f.Size)
+	if f.Size != 77 {
+		t.Fatalf("Expected Size %v, got %v", 77, f.Size)
 	}
 	if _, ok := f.Reader.(*filesystem.PathReader); !ok {
 		t.Fatalf("Expected Reader to be PathReader, got %v", f.Reader)
@@ -59,8 +83,8 @@ func TestNewFileFromBytes(t *testing.T) {
 		t.Fatal("Expected error, got nil")
 	}
 
-	originalName := "image_! noext"
-	normalizedNamePattern := regexp.QuoteMeta("image_noext_") + `\w{10}` + regexp.QuoteMeta(".txt")
+	originalName := "image_!@ special"
+	normalizedNamePattern := regexp.QuoteMeta("image_special_") + `\w{10}` + regexp.QuoteMeta(".txt")
 	f, err := filesystem.NewFileFromBytes([]byte("text\n"), originalName)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +107,7 @@ func TestNewFileFromMultipart(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("", "/", formData)
-	req.Header.Set(echo.HeaderContentType, mp.FormDataContentType())
+	req.Header.Set("Content-Type", mp.FormDataContentType())
 	req.ParseMultipartForm(32 << 20)
 
 	_, mh, err := req.FormFile("test")
@@ -115,7 +139,7 @@ func TestNewFileFromMultipart(t *testing.T) {
 	}
 }
 
-func TestNewFileFromUrlTimeout(t *testing.T) {
+func TestNewFileFromURLTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/error" {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -129,7 +153,7 @@ func TestNewFileFromUrlTimeout(t *testing.T) {
 	{
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		f, err := filesystem.NewFileFromUrl(ctx, srv.URL+"/cancel")
+		f, err := filesystem.NewFileFromURL(ctx, srv.URL+"/cancel")
 		if err == nil {
 			t.Fatal("[ctx_cancel] Expected error, got nil")
 		}
@@ -140,7 +164,7 @@ func TestNewFileFromUrlTimeout(t *testing.T) {
 
 	// error response
 	{
-		f, err := filesystem.NewFileFromUrl(context.Background(), srv.URL+"/error")
+		f, err := filesystem.NewFileFromURL(context.Background(), srv.URL+"/error")
 		if err == nil {
 			t.Fatal("[error_status] Expected error, got nil")
 		}
@@ -151,10 +175,10 @@ func TestNewFileFromUrlTimeout(t *testing.T) {
 
 	// valid response
 	{
-		originalName := "image_! noext"
-		normalizedNamePattern := regexp.QuoteMeta("image_noext_") + `\w{10}` + regexp.QuoteMeta(".txt")
+		originalName := "image_!@ special"
+		normalizedNamePattern := regexp.QuoteMeta("image_special_") + `\w{10}` + regexp.QuoteMeta(".txt")
 
-		f, err := filesystem.NewFileFromUrl(context.Background(), srv.URL+"/"+originalName)
+		f, err := filesystem.NewFileFromURL(context.Background(), srv.URL+"/"+originalName)
 		if err != nil {
 			t.Fatalf("[valid] Unexpected error %v", err)
 		}
@@ -187,10 +211,14 @@ func TestFileNameNormalizations(t *testing.T) {
 		{".png", `^\w{10}_\w{10}\.png$`},
 		{".tar.gz", `^\w{10}_\w{10}\.tar\.gz$`},
 		{"a.tar.gz", `^a\w{10}_\w{10}\.tar\.gz$`},
+		{"....abc", `^\w{10}_\w{10}\.abc$`},
+		{"a.b.c.?.?.?.2", `^a_b_c_\w{10}\.2$`},
 		{"a.b.c.d.tar.gz", `^a_b_c_d_\w{10}\.tar\.gz$`},
 		{"abcd", `^abcd_\w{10}\.txt$`},
-		{"a  b! c d  . 456", `^a_b_c_d_\w{10}\.456$`},                                        // normalize spaces
-		{strings.Repeat("a", 101) + "." + strings.Repeat("b", 21), `^a{100}_\w{10}\.b{20}$`}, // name and extension length trim
+		{".abcd.123.", `^abcd_\w{10}\.123$`},
+		{"a  b! c d  . 456", `^a_b_c_d_\w{10}\.456$`},                                              // normalize spaces
+		{strings.Repeat("a", 101) + "." + strings.Repeat("b", 21), `^a{100}_\w{10}\.b{20}$`},       // name and extension length cut
+		{"abc" + strings.Repeat("d", 290) + "." + strings.Repeat("b", 9), `^d{100}_\w{10}\.b{9}$`}, // initial total length cut
 	}
 
 	for i, s := range scenarios {
@@ -199,7 +227,8 @@ func TestFileNameNormalizations(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if match, err := regexp.Match(s.pattern, []byte(f.Name)); !match {
+			match, err := regexp.Match(s.pattern, []byte(f.Name))
+			if !match {
 				t.Fatalf("Expected Name to match %v, got %q (%v)", s.pattern, f.Name, err)
 			}
 		})

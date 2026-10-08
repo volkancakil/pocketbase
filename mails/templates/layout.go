@@ -53,7 +53,7 @@ const Layout = `
         .btn {
             display: inline-block;
             vertical-align: top;
-            border: 1px solid #e5e5e5;
+            border: 0;
             cursor: pointer;
             color: #fff !important;
             background: #16161a !important;
@@ -64,7 +64,7 @@ const Layout = `
             text-align: center;
             padding: 0 20px;
             margin: 5px 0;
-            font-family: Source Sans Pro, sans-serif, emoji;;
+            font-family: Source Sans Pro, sans-serif, emoji;
             font-size: 14px;
             font-weight: bold;
             border-radius: 6px;

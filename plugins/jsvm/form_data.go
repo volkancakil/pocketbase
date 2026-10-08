@@ -84,9 +84,7 @@ func (data FormData) Values() []any {
 	result := make([]any, 0, len(data))
 
 	for _, values := range data {
-		for _, v := range values {
-			result = append(result, v)
-		}
+		result = append(result, values...)
 	}
 
 	return result
@@ -128,7 +126,8 @@ func (data FormData) toMultipart() (*bytes.Buffer, *multipart.Writer, error) {
 					}
 					defer file.Close()
 
-					if _, err := io.Copy(mpw, file); err != nil {
+					_, err = io.Copy(mpw, file)
+					if err != nil {
 						return err
 					}
 
@@ -138,7 +137,8 @@ func (data FormData) toMultipart() (*bytes.Buffer, *multipart.Writer, error) {
 					return nil, nil, err
 				}
 			default:
-				if err := mp.WriteField(k, cast.ToString(v)); err != nil {
+				err := mp.WriteField(k, cast.ToString(v))
+				if err != nil {
 					return nil, nil, err
 				}
 			}

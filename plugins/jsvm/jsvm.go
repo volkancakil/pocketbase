@@ -1,10 +1,13 @@
 // Package jsvm implements pluggable utilities for binding a JS goja runtime
 // to the PocketBase instance (loading migrations, attaching to app hooks, etc.).
 //
+// The package also exports several reusable bindings so that users
+// can utilize them as part of their own custom goja runtime setup.
+//
 // Example:
 //
 //	jsvm.MustRegister(app, jsvm.Config{
-//		WatchHooks: true,
+//		HooksWatch: true,
 //	})
 package jsvm
 
@@ -22,22 +25,37 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/buffer"
 	"github.com/dop251/goja_nodejs/console"
 	"github.com/dop251/goja_nodejs/process"
 	"github.com/dop251/goja_nodejs/require"
 	"github.com/fatih/color"
 	"github.com/fsnotify/fsnotify"
-	"github.com/labstack/echo/v5"
-	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
-	m "github.com/pocketbase/pocketbase/migrations"
 	"github.com/pocketbase/pocketbase/plugins/jsvm/internal/types/generated"
+	"github.com/pocketbase/pocketbase/tools/routine"
 	"github.com/pocketbase/pocketbase/tools/template"
 )
 
-const (
-	typesFileName = "types.d.ts"
-)
+const typesFileName = "types.d.ts"
+
+var defaultScriptPath = "pb.js"
+
+func init() {
+	// For backward compatibility and consistency with the Go exposed
+	// methods that operate with relative paths (e.g. `$os.writeFile`),
+	// we define the "current JS module" as if it is a file in the current working directory
+	// (the filename itself doesn't really matter and in our case the hook handlers are executed as separate "programs").
+	//
+	// This is necessary for `require(module)` to properly traverse parents node_modules (goja_nodejs#95).
+	cwd, err := os.Getwd()
+	if err != nil {
+		// truly rare case, log just for debug purposes
+		color.Yellow("Failed to retrieve the current working directory: %v", err)
+	} else {
+		defaultScriptPath = filepath.Join(cwd, defaultScriptPath)
+	}
+}
 
 // Config defines the config options of the jsvm plugin.
 type Config struct {
@@ -65,10 +83,10 @@ type Config struct {
 	HooksFilesPattern string
 
 	// HooksPoolSize specifies how many goja.Runtime instances to prewarm
-	// and keep for the JS app hooks gorotines execution.
+	// and keep for the JS app hooks goroutine execution to reuse.
 	//
-	// Zero or negative value means that it will create a new goja.Runtime
-	// on every fired goroutine.
+	// Zero or negative value means that no pool will be maintained and
+	// instead it will create a new goja.Runtime on every fired goroutine.
 	HooksPoolSize int
 
 	// MigrationsDir specifies the JS migrations directory.
@@ -99,7 +117,7 @@ type Config struct {
 //		OnInit: func(vm *goja.Runtime) {
 //			// register custom bindings
 //			vm.Set("myCustomVar", 123)
-//		}
+//		},
 //	})
 func MustRegister(app core.App, config Config) {
 	if err := Register(app, config); err != nil {
@@ -131,9 +149,15 @@ func Register(app core.App, config Config) error {
 		p.config.TypesDir = app.DataDir()
 	}
 
-	p.app.OnAfterBootstrap().Add(func(e *core.BootstrapEvent) error {
+	p.app.OnBootstrap().BindFunc(func(e *core.BootstrapEvent) error {
+		err := e.Next()
+		if err != nil {
+			return err
+		}
+
 		// ensure that the user has the latest types declaration
-		if err := p.refreshTypesFile(); err != nil {
+		err = p.refreshTypesFile()
+		if err != nil {
 			color.Yellow("Unable to refresh app types file: %v", err)
 		}
 
@@ -164,30 +188,64 @@ func (p *plugin) registerMigrations() error {
 		return err
 	}
 
+	absHooksDir, err := filepath.Abs(p.config.HooksDir)
+	if err != nil {
+		return err
+	}
+
 	registry := new(require.Registry) // this can be shared by multiple runtimes
+	templateRegistry := template.NewRegistry()
 
 	for file, content := range files {
 		vm := goja.New()
+
 		registry.Enable(vm)
 		console.Enable(vm)
 		process.Enable(vm)
-		baseBinds(vm)
-		dbxBinds(vm)
-		tokensBinds(vm)
-		securityBinds(vm)
-		osBinds(vm)
-		filepathBinds(vm)
-		httpClientBinds(vm)
+		buffer.Enable(vm)
 
-		vm.Set("migrate", func(up, down func(db dbx.Builder) error) {
-			m.AppMigrations.Register(up, down, file)
+		BindCore(vm)
+		BindDbx(vm)
+		BindSecurity(vm)
+		BindOS(vm)
+		BindFilepath(vm)
+		BindHTTP(vm)
+		BindFilesystem(vm)
+		BindForms(vm)
+		BindMails(vm)
+
+		vm.Set("$template", templateRegistry)
+		vm.Set("__hooks", absHooksDir)
+
+		vm.Set("migrate", func(up, down func(txApp core.App) error) {
+			// note: safe wrap to capture any eventual panic and to allow
+			// the error message to print the migration filename
+			core.AppMigrations.Register(
+				func(txApp core.App) error {
+					return routine.SafeWrap(func() error {
+						if up == nil {
+							return nil
+						}
+						return up(txApp)
+					})()
+				},
+				func(txApp core.App) error {
+					return routine.SafeWrap(func() error {
+						if down == nil {
+							return nil
+						}
+						return down(txApp)
+					})()
+				},
+				file,
+			)
 		})
 
 		if p.config.OnInit != nil {
 			p.config.OnInit(vm)
 		}
 
-		_, err := vm.RunString(string(content))
+		_, err := vm.RunScript(defaultScriptPath, string(content))
 		if err != nil {
 			return fmt.Errorf("failed to run migration %s: %w", file, err)
 		}
@@ -224,7 +282,7 @@ func (p *plugin) registerHooks() error {
 	// initialize the hooks dir watcher
 	if p.config.HooksWatch {
 		if err := p.watchHooks(); err != nil {
-			return err
+			color.Yellow("Unable to init hooks watcher: %v", err)
 		}
 	}
 
@@ -238,9 +296,10 @@ func (p *plugin) registerHooks() error {
 		return err
 	}
 
-	p.app.OnBeforeServe().Add(func(e *core.ServeEvent) error {
-		e.Router.HTTPErrorHandler = p.normalizeServeExceptions(e.Router.HTTPErrorHandler)
-		return nil
+	p.app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		e.Router.BindFunc(p.normalizeServeExceptions)
+
+		return e.Next()
 	})
 
 	// safe to be shared across multiple vms
@@ -251,18 +310,18 @@ func (p *plugin) registerHooks() error {
 		requireRegistry.Enable(vm)
 		console.Enable(vm)
 		process.Enable(vm)
+		buffer.Enable(vm)
 
-		baseBinds(vm)
-		dbxBinds(vm)
-		filesystemBinds(vm)
-		tokensBinds(vm)
-		securityBinds(vm)
-		osBinds(vm)
-		filepathBinds(vm)
-		httpClientBinds(vm)
-		formsBinds(vm)
-		apisBinds(vm)
-		mailsBinds(vm)
+		BindCore(vm)
+		BindDbx(vm)
+		BindSecurity(vm)
+		BindOS(vm)
+		BindFilepath(vm)
+		BindHTTP(vm)
+		BindFilesystem(vm)
+		BindForms(vm)
+		BindMails(vm)
+		BindApis(vm)
 
 		vm.Set("$app", p.app)
 		vm.Set("$template", templateRegistry)
@@ -291,7 +350,7 @@ func (p *plugin) registerHooks() error {
 		func() {
 			defer func() {
 				if err := recover(); err != nil {
-					fmtErr := fmt.Errorf("Failed to execute %s:\n - %v", file, err)
+					fmtErr := fmt.Errorf("failed to execute %s:\n - %v", file, err)
 
 					if p.config.HooksWatch {
 						color.Red("%v", fmtErr)
@@ -301,7 +360,7 @@ func (p *plugin) registerHooks() error {
 				}
 			}()
 
-			_, err := loader.RunString(string(content))
+			_, err := loader.RunScript(defaultScriptPath, string(content))
 			if err != nil {
 				panic(err)
 			}
@@ -311,32 +370,17 @@ func (p *plugin) registerHooks() error {
 	return nil
 }
 
-// normalizeExceptions wraps the provided error handler and returns a new one
-// with extracted goja exception error value for consistency when throwing or returning errors.
-func (p *plugin) normalizeServeExceptions(oldErrorHandler echo.HTTPErrorHandler) echo.HTTPErrorHandler {
-	return func(c echo.Context, err error) {
-		defer func() {
-			oldErrorHandler(c, err)
-		}()
+// normalizeExceptions registers a global error handler that
+// wraps the extracted goja exception error value for consistency
+// when throwing or returning errors.
+func (p *plugin) normalizeServeExceptions(e *core.RequestEvent) error {
+	err := e.Next()
 
-		if err == nil || c.Response().Committed {
-			return // no error or already committed
-		}
-
-		jsException, ok := err.(*goja.Exception)
-		if !ok {
-			return // no exception
-		}
-
-		switch v := jsException.Value().Export().(type) {
-		case error:
-			err = v
-		case map[string]any: // goja.GoError
-			if vErr, ok := v["value"].(error); ok {
-				err = vErr
-			}
-		}
+	if err == nil || e.Written() {
+		return err // no error or already committed
 	}
+
+	return normalizeException(err)
 }
 
 // watchHooks initializes a hooks file watcher that will restart the
@@ -344,11 +388,21 @@ func (p *plugin) normalizeServeExceptions(oldErrorHandler echo.HTTPErrorHandler)
 //
 // This method does nothing if the hooks directory is missing.
 func (p *plugin) watchHooks() error {
-	if _, err := os.Stat(p.config.HooksDir); err != nil {
+	watchDir := p.config.HooksDir
+
+	hooksDirInfo, err := os.Lstat(p.config.HooksDir)
+	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil // no hooks dir to watch
 		}
 		return err
+	}
+
+	if hooksDirInfo.Mode()&os.ModeSymlink == os.ModeSymlink {
+		watchDir, err = filepath.EvalSymlinks(p.config.HooksDir)
+		if err != nil {
+			return fmt.Errorf("failed to resolve hooksDir symlink: %w", err)
+		}
 	}
 
 	watcher, err := fsnotify.NewWatcher()
@@ -365,16 +419,16 @@ func (p *plugin) watchHooks() error {
 		}
 	}
 
-	p.app.OnTerminate().Add(func(e *core.TerminateEvent) error {
+	p.app.OnTerminate().BindFunc(func(e *core.TerminateEvent) error {
 		watcher.Close()
 
 		stopDebounceTimer()
 
-		return nil
+		return e.Next()
 	})
 
 	// start listening for events.
-	go func() {
+	routine.FireAndForget(func() {
 		defer stopDebounceTimer()
 
 		for {
@@ -389,7 +443,7 @@ func (p *plugin) watchHooks() error {
 				debounceTimer = time.AfterFunc(50*time.Millisecond, func() {
 					// app restart is currently not supported on Windows
 					if runtime.GOOS == "windows" {
-						color.Yellow("File %s changed, please restart the app", event.Name)
+						color.Yellow("File %s changed, please restart the app manually", event.Name)
 					} else {
 						color.Yellow("File %s changed, restarting...", event.Name)
 						if err := p.app.Restart(); err != nil {
@@ -404,15 +458,20 @@ func (p *plugin) watchHooks() error {
 				color.Red("Watch error:", err)
 			}
 		}
-	}()
+	})
 
 	// add directories to watch
 	//
 	// @todo replace once recursive watcher is added (https://github.com/fsnotify/fsnotify/issues/18)
-	dirsErr := filepath.Walk(p.config.HooksDir, func(path string, info fs.FileInfo, err error) error {
-		// ignore hidden directories and node_modules
-		if !info.IsDir() || info.Name() == "node_modules" || strings.HasPrefix(info.Name(), ".") {
+	dirsErr := filepath.WalkDir(watchDir, func(path string, entry fs.DirEntry, err error) error {
+		// ignore access failures and non-dir entries
+		if err != nil || !entry.IsDir() {
 			return nil
+		}
+
+		// skip traversing hidden directories and node_modules
+		if strings.HasPrefix(entry.Name(), ".") || entry.Name() == "node_modules" {
+			return filepath.SkipDir
 		}
 
 		return watcher.Add(path)

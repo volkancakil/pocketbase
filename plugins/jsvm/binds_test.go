@@ -1,12 +1,15 @@
 package jsvm
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,17 +17,14 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
-	validation "github.com/go-ozzo/ozzo-validation/v4"
-	"github.com/pocketbase/dbx"
+	validation "github.com/pocketbase/ozzo-validation/v4"
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
-	"github.com/pocketbase/pocketbase/daos"
-	"github.com/pocketbase/pocketbase/models"
-	"github.com/pocketbase/pocketbase/models/schema"
 	"github.com/pocketbase/pocketbase/tests"
 	"github.com/pocketbase/pocketbase/tools/filesystem"
 	"github.com/pocketbase/pocketbase/tools/mailer"
-	"github.com/pocketbase/pocketbase/tools/security"
+	"github.com/pocketbase/pocketbase/tools/router"
+	"github.com/pocketbase/pocketbase/tools/types"
 	"github.com/spf13/cast"
 )
 
@@ -43,19 +43,16 @@ func testBindsCount(vm *goja.Runtime, namespace string, count int, t *testing.T)
 
 // note: this test is useful as a reminder to update the tests in case
 // a new base binding is added.
-func TestBaseBindsCount(t *testing.T) {
+func TestBindCoreCount(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
-	testBindsCount(vm, "this", 17, t)
+	testBindsCount(vm, "this", 41, t)
 }
 
-func TestBaseBindsSleep(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindCoreSleep(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 	vm.Set("reader", strings.NewReader("test"))
 
 	start := time.Now()
@@ -72,12 +69,9 @@ func TestBaseBindsSleep(t *testing.T) {
 	}
 }
 
-func TestBaseBindsReaderToString(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindCoreReaderToString(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 	vm.Set("reader", strings.NewReader("test"))
 
 	_, err := vm.RunString(`
@@ -92,12 +86,128 @@ func TestBaseBindsReaderToString(t *testing.T) {
 	}
 }
 
-func TestBaseBindsCookie(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindCoreToString(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
+	vm.Set("scenarios", []struct {
+		Name     string
+		Value    any
+		Expected string
+	}{
+		{"null", nil, ""},
+		{"string", "test", "test"},
+		{"number", -12.4, "-12.4"},
+		{"bool", true, "true"},
+		{"arr", []int{1, 2, 3}, `[1,2,3]`},
+		{"obj", map[string]any{"test": 123}, `{"test":123}`},
+		{"reader", strings.NewReader("test"), "test"},
+		{"struct", struct {
+			Name    string
+			private string
+		}{Name: "123", private: "456"}, `{"Name":"123"}`},
+	})
+
+	_, err := vm.RunString(`
+		for (let s of scenarios) {
+			let str = toString(s.value)
+			if (str != s.expected) {
+				throw new Error('[' + s.name + '] Expected string ' + s.expected + ', got ' + str);
+			}
+		}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindCoreToBytes(t *testing.T) {
+	vm := goja.New()
+	BindCore(vm)
+	vm.Set("bytesEqual", bytes.Equal)
+	vm.Set("scenarios", []struct {
+		Name     string
+		Value    any
+		Expected []byte
+	}{
+		{"null", nil, []byte{}},
+		{"string", "test", []byte("test")},
+		{"number", -12.4, []byte("-12.4")},
+		{"bool", true, []byte("true")},
+		{"arr", []int{1, 2, 3}, []byte{1, 2, 3}},
+		{"jsonraw", types.JSONRaw{1, 2, 3}, []byte{1, 2, 3}},
+		{"reader", strings.NewReader("test"), []byte("test")},
+		{"obj", map[string]any{"test": 123}, []byte(`{"test":123}`)},
+		{"struct", struct {
+			Name    string
+			private string
+		}{Name: "123", private: "456"}, []byte(`{"Name":"123"}`)},
+	})
+
+	_, err := vm.RunString(`
+		for (let s of scenarios) {
+			let b = toBytes(s.value)
+			if (!Array.isArray(b)) {
+				throw new Error('[' + s.name + '] Expected toBytes to return an array');
+			}
+
+			if (!bytesEqual(b, s.expected)) {
+				throw new Error('[' + s.name + '] Expected bytes ' + s.expected + ', got ' + b);
+			}
+		}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindCoreUnmarshal(t *testing.T) {
+	vm := goja.New()
+	BindCore(vm)
+	vm.Set("data", &map[string]any{"a": 123})
+
+	_, err := vm.RunString(`
+		unmarshal({"b": 456}, data)
+
+		if (data.a != 123) {
+			throw new Error('Expected data.a 123, got ' + data.a);
+		}
+
+		if (data.b != 456) {
+			throw new Error('Expected data.b 456, got ' + data.b);
+		}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindCoreContext(t *testing.T) {
+	vm := goja.New()
+	BindCore(vm)
+
+	_, err := vm.RunString(`
+		const base = new Context(null, "a", 123);
+		const sub = new Context(base, "b", 456);
+
+		const scenarios = [
+			{key: "a", expected: 123},
+			{key: "b", expected: 456},
+		];
+
+		for (let s of scenarios) {
+			if (sub.value(s.key) != s.expected) {
+				throw new("Expected " +s.key + " value " + s.expected + ", got " + sub.value(s.key));
+			}
+		}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindCoreCookie(t *testing.T) {
+	vm := goja.New()
+	BindCore(vm)
 
 	_, err := vm.RunString(`
 		const cookie = new Cookie({
@@ -124,12 +234,9 @@ func TestBaseBindsCookie(t *testing.T) {
 	}
 }
 
-func TestBaseBindsSubscriptionMessage(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindCoreSubscriptionMessage(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 	vm.Set("bytesToString", func(b []byte) string {
 		return string(b)
 	})
@@ -155,17 +262,17 @@ func TestBaseBindsSubscriptionMessage(t *testing.T) {
 	}
 }
 
-func TestBaseBindsRecord(t *testing.T) {
+func TestBindCoreRecord(t *testing.T) {
 	app, _ := tests.NewTestApp()
 	defer app.Cleanup()
 
-	collection, err := app.Dao().FindCollectionByNameOrId("users")
+	collection, err := app.FindCachedCollectionByNameOrId("users")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 	vm.Set("collection", collection)
 
 	// without record data
@@ -175,7 +282,7 @@ func TestBaseBindsRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m1, ok := v1.Export().(*models.Record)
+	m1, ok := v1.Export().(*core.Record)
 	if !ok {
 		t.Fatalf("Expected m1 to be models.Record, got \n%v", m1)
 	}
@@ -187,9 +294,9 @@ func TestBaseBindsRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m2, ok := v2.Export().(*models.Record)
+	m2, ok := v2.Export().(*core.Record)
 	if !ok {
-		t.Fatalf("Expected m2 to be models.Record, got \n%v", m2)
+		t.Fatalf("Expected m2 to be core.Record, got \n%v", m2)
 	}
 
 	if m2.Collection().Name != "users" {
@@ -201,18 +308,18 @@ func TestBaseBindsRecord(t *testing.T) {
 	}
 }
 
-func TestBaseBindsCollection(t *testing.T) {
+func TestBindCoreCollection(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
-	v, err := vm.RunString(`new Collection({ name: "test", createRule: "@request.auth.id != ''", schema: [{name: "title", "type": "text"}] })`)
+	v, err := vm.RunString(`new Collection({ name: "test", createRule: "@request.auth.id != ''", fields: [{name: "title", "type": "text"}] })`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	m, ok := v.Export().(*models.Collection)
+	m, ok := v.Export().(*core.Collection)
 	if !ok {
-		t.Fatalf("Expected models.Collection, got %v", m)
+		t.Fatalf("Expected core.Collection, got %v", m)
 	}
 
 	if m.Name != "test" {
@@ -224,67 +331,148 @@ func TestBaseBindsCollection(t *testing.T) {
 		t.Fatalf("Expected create rule %q, got %v", "@request.auth.id != ''", m.CreateRule)
 	}
 
-	if f := m.Schema.GetFieldByName("title"); f == nil {
-		t.Fatalf("Expected schema to be set, got %v", m.Schema)
+	if f := m.Fields.GetByName("title"); f == nil {
+		t.Fatalf("Expected fields to be set, got %v", m.Fields)
 	}
 }
 
-func TestBaseVMAdminBind(t *testing.T) {
+func TestBindCoreFieldsList(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
-	v, err := vm.RunString(`new Admin({ email: "test@example.com" })`)
+	v, err := vm.RunString(`new FieldsList([{name: "title", "type": "text"}])`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	m, ok := v.Export().(*models.Admin)
+	m, ok := v.Export().(*core.FieldsList)
 	if !ok {
-		t.Fatalf("Expected models.Admin, got %v", m)
+		t.Fatalf("Expected core.FieldsList, got %v", m)
+	}
+
+	if f := m.GetByName("title"); f == nil {
+		t.Fatalf("Expected fields list to be loaded, got %v", m)
 	}
 }
 
-func TestBaseBindsSchema(t *testing.T) {
+func TestBindCoreField(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
-	v, err := vm.RunString(`new Schema([{name: "title", "type": "text"}])`)
+	v, err := vm.RunString(`new Field({name: "test", "type": "bool"})`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	m, ok := v.Export().(*schema.Schema)
+	f, ok := v.Export().(*core.BoolField)
 	if !ok {
-		t.Fatalf("Expected schema.Schema, got %v", m)
+		t.Fatalf("Expected *core.BoolField, got %v", f)
 	}
 
-	if f := m.GetFieldByName("title"); f == nil {
-		t.Fatalf("Expected schema fields to be loaded, got %v", m.Fields())
+	if f.Name != "test" {
+		t.Fatalf("Expected field %q, got %v", "test", f)
 	}
 }
 
-func TestBaseBindsSchemaField(t *testing.T) {
+func isType[T any](v any) bool {
+	_, ok := v.(T)
+	return ok
+}
+
+func TestBindCoreNamedFields(t *testing.T) {
+	t.Parallel()
+
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
-	v, err := vm.RunString(`new SchemaField({name: "title", "type": "text"})`)
-	if err != nil {
-		t.Fatal(err)
+	scenarios := []struct {
+		js       string
+		typeFunc func(v any) bool
+	}{
+		{
+			"new NumberField({name: 'test'})",
+			isType[*core.NumberField],
+		},
+		{
+			"new BoolField({name: 'test'})",
+			isType[*core.BoolField],
+		},
+		{
+			"new TextField({name: 'test'})",
+			isType[*core.TextField],
+		},
+		{
+			"new URLField({name: 'test'})",
+			isType[*core.URLField],
+		},
+		{
+			"new EmailField({name: 'test'})",
+			isType[*core.EmailField],
+		},
+		{
+			"new EditorField({name: 'test'})",
+			isType[*core.EditorField],
+		},
+		{
+			"new PasswordField({name: 'test'})",
+			isType[*core.PasswordField],
+		},
+		{
+			"new DateField({name: 'test'})",
+			isType[*core.DateField],
+		},
+		{
+			"new AutodateField({name: 'test'})",
+			isType[*core.AutodateField],
+		},
+		{
+			"new JSONField({name: 'test'})",
+			isType[*core.JSONField],
+		},
+		{
+			"new RelationField({name: 'test'})",
+			isType[*core.RelationField],
+		},
+		{
+			"new SelectField({name: 'test'})",
+			isType[*core.SelectField],
+		},
+		{
+			"new FileField({name: 'test'})",
+			isType[*core.FileField],
+		},
+		{
+			"new GeoPointField({name: 'test'})",
+			isType[*core.GeoPointField],
+		},
 	}
 
-	f, ok := v.Export().(*schema.SchemaField)
-	if !ok {
-		t.Fatalf("Expected schema.SchemaField, got %v", f)
-	}
+	for _, s := range scenarios {
+		t.Run(s.js, func(t *testing.T) {
+			v, err := vm.RunString(s.js)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	if f.Name != "title" {
-		t.Fatalf("Expected field %q, got %v", "title", f)
+			f, ok := v.Export().(core.Field)
+			if !ok {
+				t.Fatalf("Expected core.Field instance, got %T (%v)", f, f)
+			}
+
+			if !s.typeFunc(f) {
+				t.Fatalf("Unexpected field type %T (%v)", f, f)
+			}
+
+			if f.GetName() != "test" {
+				t.Fatalf("Expected field %q, got %v", "test", f)
+			}
+		})
 	}
 }
 
-func TestBaseBindsMailerMessage(t *testing.T) {
+func TestBindCoreMailerMessage(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
 	v, err := vm.RunString(`new MailerMessage({
 		from: {name: "test_from", address: "test_from@example.com"},
@@ -317,21 +505,21 @@ func TestBaseBindsMailerMessage(t *testing.T) {
 		t.Fatalf("Expected mailer.Message, got %v", m)
 	}
 
-	raw, err := json.Marshal(m)
+	raw, err := json.Marshal(m, json.Deterministic(true))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expected := `{"from":{"Name":"test_from","Address":"test_from@example.com"},"to":[{"Name":"test_to1","Address":"test_to1@example.com"},{"Name":"test_to2","Address":"test_to2@example.com"}],"bcc":[{"Name":"test_bcc1","Address":"test_bcc1@example.com"},{"Name":"test_bcc2","Address":"test_bcc2@example.com"}],"cc":[{"Name":"test_cc1","Address":"test_cc1@example.com"},{"Name":"test_cc2","Address":"test_cc2@example.com"}],"subject":"test_subject","html":"test_html","text":"test_text","headers":{"header1":"a","header2":"b"},"attachments":null}`
+	expected := `{"from":{"Name":"test_from","Address":"test_from@example.com"},"to":[{"Name":"test_to1","Address":"test_to1@example.com"},{"Name":"test_to2","Address":"test_to2@example.com"}],"bcc":[{"Name":"test_bcc1","Address":"test_bcc1@example.com"},{"Name":"test_bcc2","Address":"test_bcc2@example.com"}],"cc":[{"Name":"test_cc1","Address":"test_cc1@example.com"},{"Name":"test_cc2","Address":"test_cc2@example.com"}],"subject":"test_subject","html":"test_html","text":"test_text","headers":{"header1":"a","header2":"b"},"attachments":{},"inlineAttachments":{}}`
 
 	if string(raw) != expected {
 		t.Fatalf("Expected \n%s, \ngot \n%s", expected, raw)
 	}
 }
 
-func TestBaseBindsCommand(t *testing.T) {
+func TestBindCoreCommand(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
 	_, err := vm.RunString(`
 		let runCalls = 0;
@@ -358,22 +546,17 @@ func TestBaseBindsCommand(t *testing.T) {
 	}
 }
 
-func TestBaseBindsRequestInfo(t *testing.T) {
+func TestBindCoreRequestInfo(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
 	_, err := vm.RunString(`
-		let info = new RequestInfo({
-			admin: new Admin({id: "test1"}),
-			data: {"name": "test2"}
+		const info = new RequestInfo({
+			body: {"name": "test2"}
 		});
 
-		if (info.admin?.id != "test1") {
-			throw new Error('Expected info.admin.id to be test1, got: ' + info.admin?.id);
-		}
-
-		if (info.data?.name != "test2") {
-			throw new Error('Expected info.data.name to be test2, got: ' + info.data?.name);
+		if (info.body?.name != "test2") {
+			throw new Error('Expected info.body.name to be test2, got: ' + info.body?.name);
 		}
 	`)
 	if err != nil {
@@ -381,20 +564,19 @@ func TestBaseBindsRequestInfo(t *testing.T) {
 	}
 }
 
-func TestBaseBindsDateTime(t *testing.T) {
+func TestBindCoreMiddleware(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
 
 	_, err := vm.RunString(`
-		const v0 = new DateTime();
-		if (v0.isZero()) {
-			throw new Error('Expected to fallback to now, got zero value');
-		}
+		const m = new Middleware(
+			(e) => {},
+			10,
+			"test"
+		);
 
-		const v1 = new DateTime('2023-01-01 00:00:00.000Z');
-		const expected = "2023-01-01 00:00:00.000Z"
-		if (v1.string() != expected) {
-			throw new Error('Expected ' + expected + ', got ', v1.string());
+		if (!m) {
+			throw new Error('Expected non-empty Middleware instance');
 		}
 	`)
 	if err != nil {
@@ -402,9 +584,75 @@ func TestBaseBindsDateTime(t *testing.T) {
 	}
 }
 
-func TestBaseBindsValidationError(t *testing.T) {
+func TestBindCoreTimezone(t *testing.T) {
 	vm := goja.New()
-	baseBinds(vm)
+	BindCore(vm)
+
+	_, err := vm.RunString(`
+		const v0 = (new Timezone()).string();
+		if (v0 != "UTC") {
+			throw new Error("(v0) Expected UTC got " + v0)
+		}
+
+		const v1 = (new Timezone("invalid")).string();
+		if (v1 != "UTC") {
+			throw new Error("(v1) Expected UTC got " + v1)
+		}
+
+		const v2 = (new Timezone("EET")).string();
+		if (v2 != "EET") {
+			throw new Error("(v2) Expected EET got " + v2)
+		}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindCoreDateTime(t *testing.T) {
+	vm := goja.New()
+	BindCore(vm)
+
+	_, err := vm.RunString(`
+		const now = new DateTime();
+		if (now.isZero()) {
+			throw new Error('(now) Expected to fallback to now, got zero value');
+		}
+
+		const nowPart = now.string().substring(0, 19)
+
+		const scenarios = [
+			// empty datetime string and no custom location
+			{date: new DateTime(''), expected: nowPart},
+			// empty datetime string and custom default location (should be ignored)
+			{date: new DateTime('', 'Asia/Tokyo'), expected: nowPart},
+			// full datetime string and no custom default location
+			{date: new DateTime('2023-01-01 00:00:00.000Z'), expected: "2023-01-01 00:00:00.000Z"},
+			// invalid location (fallback to UTC)
+			{date: new DateTime('2025-10-26 03:00:00', 'invalid'), expected: "2025-10-26 03:00:00.000Z"},
+			// CET
+			{date: new DateTime('2025-10-26 03:00:00', 'Europe/Amsterdam'), expected: "2025-10-26 02:00:00.000Z"},
+			// CEST
+			{date: new DateTime('2025-10-26 01:00:00', 'Europe/Amsterdam'), expected: "2025-10-25 23:00:00.000Z"},
+			// with timezone/offset in the date string (aka. should ignore the custom default location)
+			{date: new DateTime('2025-10-26 01:00:00 +0200', 'Asia/Tokyo'), expected: "2025-10-25 23:00:00.000Z"},
+		];
+
+		for (let i = 0; i < scenarios.length; i++) {
+			const s = scenarios[i];
+			if (!s.date.string().includes(s.expected)) {
+				throw new Error('(' + i + ') ' + s.date.string() + ' does not contain expected ' + s.expected);
+			}
+		}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBindCoreValidationError(t *testing.T) {
+	vm := goja.New()
+	BindCore(vm)
 
 	scenarios := []struct {
 		js            string
@@ -449,61 +697,14 @@ func TestBaseBindsValidationError(t *testing.T) {
 	}
 }
 
-func TestBaseBindsDao(t *testing.T) {
+func TestBindDbx(t *testing.T) {
 	app, _ := tests.NewTestApp()
 	defer app.Cleanup()
 
 	vm := goja.New()
-	baseBinds(vm)
-	vm.Set("db", app.Dao().ConcurrentDB())
-	vm.Set("db2", app.Dao().NonconcurrentDB())
-
-	scenarios := []struct {
-		js              string
-		concurrentDB    dbx.Builder
-		nonconcurrentDB dbx.Builder
-	}{
-		{
-			js:              "new Dao(db)",
-			concurrentDB:    app.Dao().ConcurrentDB(),
-			nonconcurrentDB: app.Dao().ConcurrentDB(),
-		},
-		{
-			js:              "new Dao(db, db2)",
-			concurrentDB:    app.Dao().ConcurrentDB(),
-			nonconcurrentDB: app.Dao().NonconcurrentDB(),
-		},
-	}
-
-	for _, s := range scenarios {
-		v, err := vm.RunString(s.js)
-		if err != nil {
-			t.Fatalf("[%s] Failed to execute js script, got %v", s.js, err)
-		}
-
-		d, ok := v.Export().(*daos.Dao)
-		if !ok {
-			t.Fatalf("[%s] Expected daos.Dao, got %v", s.js, d)
-		}
-
-		if d.ConcurrentDB() != s.concurrentDB {
-			t.Fatalf("[%s] The ConcurrentDB instances doesn't match", s.js)
-		}
-
-		if d.NonconcurrentDB() != s.nonconcurrentDB {
-			t.Fatalf("[%s] The NonconcurrentDB instances doesn't match", s.js)
-		}
-	}
-}
-
-func TestDbxBinds(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
-	vm := goja.New()
-	vm.Set("db", app.Dao().DB())
-	baseBinds(vm)
-	dbxBinds(vm)
+	vm.Set("db", app.DB())
+	BindCore(vm)
+	BindDbx(vm)
 
 	testBindsCount(vm, "$dbx", 15, t)
 
@@ -591,53 +792,52 @@ func TestDbxBinds(t *testing.T) {
 	}
 }
 
-func TestMailsBindsCount(t *testing.T) {
+func TestBindMailsCount(t *testing.T) {
 	vm := goja.New()
-	mailsBinds(vm)
+	BindMails(vm)
 
-	testBindsCount(vm, "$mails", 4, t)
+	testBindsCount(vm, "$mails", 5, t)
 }
 
-func TestMailsBinds(t *testing.T) {
+func TestBindMails(t *testing.T) {
 	app, _ := tests.NewTestApp()
 	defer app.Cleanup()
 
-	admin, err := app.Dao().FindAdminByEmail("test@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	record, err := app.Dao().FindAuthRecordByEmail("users", "test@example.com")
+	record, err := app.FindAuthRecordByEmail("users", "test@example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	vm := goja.New()
-	baseBinds(vm)
-	mailsBinds(vm)
+	BindCore(vm)
+	BindMails(vm)
 	vm.Set("$app", app)
-	vm.Set("admin", admin)
 	vm.Set("record", record)
 
 	_, vmErr := vm.RunString(`
-		$mails.sendAdminPasswordReset($app, admin);
-		if (!$app.testMailer.lastMessage.html.includes("/_/#/confirm-password-reset/")) {
-			throw new Error("Expected admin password reset email")
-		}
-
 		$mails.sendRecordPasswordReset($app, record);
-		if (!$app.testMailer.lastMessage.html.includes("/_/#/auth/confirm-password-reset/")) {
-			throw new Error("Expected record password reset email")
+		if (!$app.testMailer.lastMessage().html.includes("/_/#/auth/confirm-password-reset/")) {
+			throw new Error("Expected record password reset email, got:" + JSON.stringify($app.testMailer.lastMessage()))
 		}
 
 		$mails.sendRecordVerification($app, record);
-		if (!$app.testMailer.lastMessage.html.includes("/_/#/auth/confirm-verification/")) {
-			throw new Error("Expected record verification email")
+		if (!$app.testMailer.lastMessage().html.includes("/_/#/auth/confirm-verification/")) {
+			throw new Error("Expected record verification email, got:" + JSON.stringify($app.testMailer.lastMessage()))
 		}
 
 		$mails.sendRecordChangeEmail($app, record, "new@example.com");
-		if (!$app.testMailer.lastMessage.html.includes("/_/#/auth/confirm-email-change/")) {
-			throw new Error("Expected record email change email")
+		if (!$app.testMailer.lastMessage().html.includes("/_/#/auth/confirm-email-change/")) {
+			throw new Error("Expected record email change email, got:" + JSON.stringify($app.testMailer.lastMessage()))
+		}
+
+		$mails.sendRecordOTP($app, record, "test_otp_id", "test_otp_pass");
+		if (!$app.testMailer.lastMessage().html.includes("test_otp_pass")) {
+			throw new Error("Expected record OTP email, got:" + JSON.stringify($app.testMailer.lastMessage()))
+		}
+
+		$mails.sendRecordAuthAlert($app, record, "test_alert_info");
+		if (!$app.testMailer.lastMessage().html.includes("test_alert_info")) {
+			throw new Error("Expected record OTP email, got:" + JSON.stringify($app.testMailer.lastMessage()))
 		}
 	`)
 	if vmErr != nil {
@@ -645,100 +845,17 @@ func TestMailsBinds(t *testing.T) {
 	}
 }
 
-func TestTokensBindsCount(t *testing.T) {
+func TestBindSecurityCount(t *testing.T) {
 	vm := goja.New()
-	tokensBinds(vm)
+	BindSecurity(vm)
 
-	testBindsCount(vm, "$tokens", 8, t)
-}
-
-func TestTokensBinds(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
-	admin, err := app.Dao().FindAdminByEmail("test@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	record, err := app.Dao().FindAuthRecordByEmail("users", "test@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	vm := goja.New()
-	baseBinds(vm)
-	tokensBinds(vm)
-	vm.Set("$app", app)
-	vm.Set("admin", admin)
-	vm.Set("record", record)
-
-	sceneraios := []struct {
-		js  string
-		key string
-	}{
-		{
-			`$tokens.adminAuthToken($app, admin)`,
-			admin.TokenKey + app.Settings().AdminAuthToken.Secret,
-		},
-		{
-			`$tokens.adminResetPasswordToken($app, admin)`,
-			admin.TokenKey + app.Settings().AdminPasswordResetToken.Secret,
-		},
-		{
-			`$tokens.adminFileToken($app, admin)`,
-			admin.TokenKey + app.Settings().AdminFileToken.Secret,
-		},
-		{
-			`$tokens.recordAuthToken($app, record)`,
-			record.TokenKey() + app.Settings().RecordAuthToken.Secret,
-		},
-		{
-			`$tokens.recordVerifyToken($app, record)`,
-			record.TokenKey() + app.Settings().RecordVerificationToken.Secret,
-		},
-		{
-			`$tokens.recordResetPasswordToken($app, record)`,
-			record.TokenKey() + app.Settings().RecordPasswordResetToken.Secret,
-		},
-		{
-			`$tokens.recordChangeEmailToken($app, record)`,
-			record.TokenKey() + app.Settings().RecordEmailChangeToken.Secret,
-		},
-		{
-			`$tokens.recordFileToken($app, record)`,
-			record.TokenKey() + app.Settings().RecordFileToken.Secret,
-		},
-	}
-
-	for _, s := range sceneraios {
-		result, err := vm.RunString(s.js)
-		if err != nil {
-			t.Fatalf("[%s] Failed to execute js script, got %v", s.js, err)
-		}
-
-		v, _ := result.Export().(string)
-
-		if _, err := security.ParseJWT(v, s.key); err != nil {
-			t.Fatalf("[%s] Failed to parse JWT %v, got %v", s.js, v, err)
-		}
-	}
-}
-
-func TestSecurityBindsCount(t *testing.T) {
-	vm := goja.New()
-	securityBinds(vm)
-
-	testBindsCount(vm, "$security", 15, t)
+	testBindsCount(vm, "$security", 16, t)
 }
 
 func TestSecurityCryptoBinds(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
 	vm := goja.New()
-	baseBinds(vm)
-	securityBinds(vm)
+	BindCore(vm)
+	BindSecurity(vm)
 
 	sceneraios := []struct {
 		js       string
@@ -770,12 +887,9 @@ func TestSecurityCryptoBinds(t *testing.T) {
 }
 
 func TestSecurityRandomStringBinds(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
 	vm := goja.New()
-	baseBinds(vm)
-	securityBinds(vm)
+	BindCore(vm)
+	BindSecurity(vm)
 
 	sceneraios := []struct {
 		js     string
@@ -785,6 +899,7 @@ func TestSecurityRandomStringBinds(t *testing.T) {
 		{`$security.randomStringWithAlphabet(7, "abc")`, 7},
 		{`$security.pseudorandomString(8)`, 8},
 		{`$security.pseudorandomStringWithAlphabet(9, "abc")`, 9},
+		{`$security.randomStringByRegex("abc")`, 3},
 	}
 
 	for _, s := range sceneraios {
@@ -804,9 +919,6 @@ func TestSecurityRandomStringBinds(t *testing.T) {
 }
 
 func TestSecurityJWTBinds(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
 	sceneraios := []struct {
 		name string
 		js   string
@@ -852,8 +964,8 @@ func TestSecurityJWTBinds(t *testing.T) {
 	for _, s := range sceneraios {
 		t.Run(s.name, func(t *testing.T) {
 			vm := goja.New()
-			baseBinds(vm)
-			securityBinds(vm)
+			BindCore(vm)
+			BindSecurity(vm)
 
 			_, err := vm.RunString(s.js)
 			if err != nil {
@@ -864,12 +976,9 @@ func TestSecurityJWTBinds(t *testing.T) {
 }
 
 func TestSecurityEncryptAndDecryptBinds(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
 	vm := goja.New()
-	baseBinds(vm)
-	securityBinds(vm)
+	BindCore(vm)
+	BindSecurity(vm)
 
 	_, err := vm.RunString(`
 		const key = "abcdabcdabcdabcdabcdabcdabcdabcd"
@@ -887,7 +996,7 @@ func TestSecurityEncryptAndDecryptBinds(t *testing.T) {
 	}
 }
 
-func TestFilesystemBinds(t *testing.T) {
+func TestBindFilesystem(t *testing.T) {
 	app, _ := tests.NewTestApp()
 	defer app.Cleanup()
 
@@ -900,14 +1009,47 @@ func TestFilesystemBinds(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	tmpDir, err := os.MkdirTemp("", "jsvm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
 	vm := goja.New()
 	vm.Set("mh", &multipart.FileHeader{Filename: "test"})
+	vm.Set("tmpDir", tmpDir)
 	vm.Set("testFile", filepath.Join(app.DataDir(), "data.db"))
-	vm.Set("baseUrl", srv.URL)
-	baseBinds(vm)
-	filesystemBinds(vm)
+	vm.Set("baseURL", srv.URL)
+	BindCore(vm)
+	BindFilesystem(vm)
 
-	testBindsCount(vm, "$filesystem", 4, t)
+	testBindsCount(vm, "$filesystem", 6, t)
+
+	// s3
+	{
+		v, err := vm.RunString(`$filesystem.s3("bucketName", "region", "endpoint", "accessKey", "secretKey", true)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fsys, ok := v.Export().(*filesystem.System)
+		if !ok {
+			t.Fatalf("[s3] Expected System instance got %v", fsys)
+		}
+	}
+
+	// local
+	{
+		v, err := vm.RunString(`$filesystem.local(tmpDir)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		fsys, ok := v.Export().(*filesystem.System)
+		if !ok {
+			t.Fatalf("[s3] Expected System instance got %v", fsys)
+		}
+	}
 
 	// fileFromPath
 	{
@@ -951,9 +1093,9 @@ func TestFilesystemBinds(t *testing.T) {
 		}
 	}
 
-	// fileFromUrl (success)
+	// fileFromURL (success)
 	{
-		v, err := vm.RunString(`$filesystem.fileFromUrl(baseUrl + "/test")`)
+		v, err := vm.RunString(`$filesystem.fileFromURL(baseURL + "/test")`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -961,47 +1103,41 @@ func TestFilesystemBinds(t *testing.T) {
 		file, _ := v.Export().(*filesystem.File)
 
 		if file == nil || file.OriginalName != "test" {
-			t.Fatalf("[fileFromUrl] Expected file with name %q, got %v", file.OriginalName, file)
+			t.Fatalf("[fileFromURL] Expected file with name %q, got %v", file.OriginalName, file)
 		}
 	}
 
-	// fileFromUrl (failure)
+	// fileFromURL (failure)
 	{
-		_, err := vm.RunString(`$filesystem.fileFromUrl(baseUrl + "/error")`)
+		_, err := vm.RunString(`$filesystem.fileFromURL(baseURL + "/error")`)
 		if err == nil {
 			t.Fatal("Expected url fetch error")
 		}
 	}
 }
 
-func TestFormsBinds(t *testing.T) {
+func TestBindForms(t *testing.T) {
 	vm := goja.New()
-	formsBinds(vm)
+	BindForms(vm)
 
-	testBindsCount(vm, "this", 20, t)
+	testBindsCount(vm, "this", 4, t)
 }
 
-func TestApisBindsCount(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindApisCount(t *testing.T) {
 	vm := goja.New()
-	apisBinds(vm)
+	BindApis(vm)
 
-	testBindsCount(vm, "this", 6, t)
-	testBindsCount(vm, "$apis", 14, t)
+	testBindsCount(vm, "this", 8, t)
+	testBindsCount(vm, "$apis", 11, t)
 }
 
-func TestApisBindsApiError(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindApisErrors(t *testing.T) {
 	vm := goja.New()
-	apisBinds(vm)
+	BindApis(vm)
 
 	scenarios := []struct {
 		js            string
-		expectCode    int
+		expectStatus  int
 		expectMessage string
 		expectData    string
 	}{
@@ -1013,8 +1149,12 @@ func TestApisBindsApiError(t *testing.T) {
 		{"new BadRequestError('test', {'test': 1})", 400, "Test.", `{"test":1}`},
 		{"new ForbiddenError()", 403, "You are not allowed to perform this request.", "null"},
 		{"new ForbiddenError('test', {'test': 1})", 403, "Test.", `{"test":1}`},
-		{"new UnauthorizedError()", 401, "Missing or invalid authentication token.", "null"},
+		{"new UnauthorizedError()", 401, "Missing or invalid authentication.", "null"},
 		{"new UnauthorizedError('test', {'test': 1})", 401, "Test.", `{"test":1}`},
+		{"new TooManyRequestsError()", 429, "Too Many Requests.", "null"},
+		{"new TooManyRequestsError('test', {'test': 1})", 429, "Test.", `{"test":1}`},
+		{"new InternalServerError()", 500, "Something went wrong while processing your request.", "null"},
+		{"new InternalServerError('test', {'test': 1})", 500, "Test.", `{"test":1}`},
 	}
 
 	for _, s := range scenarios {
@@ -1024,21 +1164,21 @@ func TestApisBindsApiError(t *testing.T) {
 			continue
 		}
 
-		apiErr, ok := v.Export().(*apis.ApiError)
+		apiErr, ok := v.Export().(*router.ApiError)
 		if !ok {
 			t.Errorf("[%s] Expected ApiError, got %v", s.js, v)
 			continue
 		}
 
-		if apiErr.Code != s.expectCode {
-			t.Errorf("[%s] Expected Code %d, got %d", s.js, s.expectCode, apiErr.Code)
+		if apiErr.Status != s.expectStatus {
+			t.Errorf("[%s] Expected Status %d, got %d", s.js, s.expectStatus, apiErr.Status)
 		}
 
 		if apiErr.Message != s.expectMessage {
 			t.Errorf("[%s] Expected Message %q, got %q", s.js, s.expectMessage, apiErr.Message)
 		}
 
-		dataRaw, _ := json.Marshal(apiErr.RawData())
+		dataRaw, _ := json.Marshal(apiErr.RawData(), json.Deterministic(true))
 		if string(dataRaw) != s.expectData {
 			t.Errorf("[%s] Expected Data %q, got %q", s.js, s.expectData, dataRaw)
 		}
@@ -1050,50 +1190,154 @@ func TestLoadingDynamicModel(t *testing.T) {
 	defer app.Cleanup()
 
 	vm := goja.New()
-	baseBinds(vm)
-	dbxBinds(vm)
+	BindCore(vm)
+	BindDbx(vm)
 	vm.Set("$app", app)
 
 	_, err := vm.RunString(`
 		let result = new DynamicModel({
-			text:        "",
-			bool:        false,
-			number:      0,
-			select_many: [],
-			json:        [],
-			// custom map-like field
-			obj: {},
+			string:          "",
+			nullString:      nullString(),
+			nullStringEmpty: nullString(),
+
+			bool:            false,
+			nullBool:        nullBool(),
+			nullBoolEmpty:   nullBool(),
+
+			int:             0,
+			nullInt:         nullInt(),
+			nullIntEmpty:    nullInt(),
+
+			float:           -0,
+			nullFloat:       nullFloat(),
+			nullFloatEmpty:  nullFloat(),
+
+			array:           [],
+			nullArray:       nullArray(),
+			nullArrayEmpty:  nullArray(),
+
+			object:          {},
+			nullObject:      nullObject(),
+			nullObjectEmpty: nullObject(),
 		})
 
-		$app.dao().db()
-			.select("text", "bool", "number", "select_many", "json", "('{\"test\": 1}') as obj")
-			.from("demo1")
-			.where($dbx.hashExp({"id": "84nmscqy84lsi1t"}))
-			.limit(1)
+		const expectations = {
+			"string":          "a",
+			"nullString":      "b",
+			"nullStringEmpty": null,
+
+			"bool":          false,
+			"nullBool":      true,
+			"nullBoolEmpty": null,
+
+			"int":          1,
+			"nullInt":      2,
+			"nullIntEmpty": null,
+
+			"float":          1.1,
+			"nullFloat":      1.2,
+			"nullFloatEmpty": null,
+
+			"array":          [1,2],
+			"nullArray":      [3,4],
+			"nullArrayEmpty": null,
+
+			"object":          {a:1},
+			"nullObject":      {a:2},
+			"nullObjectEmpty": null,
+		};
+
+		// construct dummy SELECT column value literals based on the expectations
+		const selectColumns = [];
+		for (const col in expectations) {
+			const val = expectations[col]
+
+			if (val === null) {
+				selectColumns.push("null as [[" + col + "]]")
+			} else if (typeof val === "string") {
+				selectColumns.push("'" + val + "' as [[" + col + "]]")
+			} else if (typeof val === "object") {
+				selectColumns.push("'" + JSON.stringify(val) + "' as [[" + col + "]]")
+			} else {
+				selectColumns.push(val + " as [[" + col + "]]")
+			}
+		}
+
+		$app.db()
+			.newQuery("SELECT " + selectColumns.join(", "))
 			.one(result)
 
-		if (result.text != "test") {
-			throw new Error('Expected text "test", got ' + result.text);
+		for (const col in expectations) {
+			let expVal = expectations[col];
+			let resVal = result[col];
+
+			if (expVal !== null && typeof expVal === "object") {
+				expVal = JSON.stringify(expVal)
+				resVal = JSON.stringify(resVal)
+			}
+
+			if (expVal != resVal) {
+				throw new Error("Expected '" + col + "' value " + expVal + ", got " + resVal);
+			}
+		}
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDynamicModelMapFieldCaching(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	vm := goja.New()
+	BindCore(vm)
+	BindDbx(vm)
+	vm.Set("$app", app)
+
+	_, err := vm.RunString(`
+		let m1 = new DynamicModel({
+			int: 0,
+			float: -0,
+			text: "",
+			bool: false,
+			obj: {},
+			arr: [],
+		})
+
+		let m2 = new DynamicModel({
+			int: 0,
+			float: -0,
+			text: "",
+			bool: false,
+			obj: {},
+			arr: [],
+		})
+
+		m1.int = 1
+		m1.float = 1.5
+		m1.text = "a"
+		m1.bool = true
+		m1.obj.set("a", 1)
+		m1.arr.push(1)
+
+		m2.int = 2
+		m2.float = 2.5
+		m2.text = "b"
+		m2.bool = false
+		m2.obj.set("b", 1)
+		m2.arr.push(2)
+
+		let m1Expected = '{"arr":[1],"bool":true,"float":1.5,"int":1,"obj":{"a":1},"text":"a"}';
+		let m1Serialized = JSON.stringify(m1);
+		if (m1Serialized != m1Expected) {
+			throw new Error("Expected m1 \n" + m1Expected + "\ngot\n" + m1Serialized);
 		}
 
-		if (result.bool != true) {
-			throw new Error('Expected bool true, got ' + result.bool);
-		}
-
-		if (result.number != 123456) {
-			throw new Error('Expected number 123456, got ' + result.number);
-		}
-
-		if (result.select_many.length != 2 || result.select_many[0] != "optionB" || result.select_many[1] != "optionC") {
-			throw new Error('Expected select_many ["optionB", "optionC"], got ' + result.select_many);
-		}
-
-		if (result.json.length != 3 || result.json[0] != 1 || result.json[1] != 2 || result.json[2] != 3) {
-			throw new Error('Expected json [1, 2, 3], got ' + result.json);
-		}
-
-		if (result.obj.get("test") != 1) {
-			throw new Error('Expected obj.get("test") 1, got ' + JSON.stringify(result.obj));
+		let m2Expected = '{"arr":[2],"bool":false,"float":2.5,"int":2,"obj":{"b":1},"text":"b"}';
+		let m2Serialized = JSON.stringify(m2);
+		if (m2Serialized != m2Expected) {
+			throw new Error("Expected m2 \n" + m2Expected + "\ngot\n" + m2Serialized);
 		}
 	`)
 	if err != nil {
@@ -1106,8 +1350,8 @@ func TestLoadingArrayOf(t *testing.T) {
 	defer app.Cleanup()
 
 	vm := goja.New()
-	baseBinds(vm)
-	dbxBinds(vm)
+	BindCore(vm)
+	BindDbx(vm)
 	vm.Set("$app", app)
 
 	_, err := vm.RunString(`
@@ -1116,7 +1360,7 @@ func TestLoadingArrayOf(t *testing.T) {
 			text: "",
 		}))
 
-		$app.dao().db()
+		$app.db()
 			.select("id", "text")
 			.from("demo1")
 			.where($dbx.exp("id='84nmscqy84lsi1t' OR id='al1h9ijdeojtsjy'"))
@@ -1147,18 +1391,20 @@ func TestLoadingArrayOf(t *testing.T) {
 	}
 }
 
-func TestHttpClientBindsCount(t *testing.T) {
+func TestBindHTTPCount(t *testing.T) {
 	app, _ := tests.NewTestApp()
 	defer app.Cleanup()
 
 	vm := goja.New()
-	httpClientBinds(vm)
+	BindHTTP(vm)
 
 	testBindsCount(vm, "this", 2, t) // + FormData
 	testBindsCount(vm, "$http", 1, t)
 }
 
-func TestHttpClientBindsSend(t *testing.T) {
+func TestBindHTTPSend(t *testing.T) {
+	t.Parallel()
+
 	// start a test server
 	server := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		if req.URL.Query().Get("testError") != "" {
@@ -1193,7 +1439,7 @@ func TestHttpClientBindsSend(t *testing.T) {
 		res.Header().Add("X-Custom", "custom_header")
 		res.Header().Add("Set-Cookie", "sessionId=123456")
 
-		infoRaw, _ := json.Marshal(info)
+		infoRaw, _ := json.Marshal(info, json.Deterministic(true))
 
 		// write back the submitted request
 		res.Write(infoRaw)
@@ -1201,9 +1447,9 @@ func TestHttpClientBindsSend(t *testing.T) {
 	defer server.Close()
 
 	vm := goja.New()
-	baseBinds(vm)
-	httpClientBinds(vm)
-	vm.Set("testUrl", server.URL)
+	BindCore(vm)
+	BindHTTP(vm)
+	vm.Set("testURL", server.URL)
 
 	_, err := vm.RunString(`
 		function getNestedVal(data, path) {
@@ -1228,7 +1474,7 @@ func TestHttpClientBindsSend(t *testing.T) {
 		let testTimeout;
 		try {
 			$http.send({
-				url:     testUrl + "?testTimeout=3",
+				url:     testURL + "?testTimeout=3",
 				timeout: 1
 			})
 		} catch (err) {
@@ -1240,20 +1486,20 @@ func TestHttpClientBindsSend(t *testing.T) {
 
 		// error response check
 		const test0 = $http.send({
-			url: testUrl + "?testError=1",
+			url: testURL + "?testError=1",
 		})
 
 		// basic fields check
 		const test1 = $http.send({
 			method:  "post",
-			url:     testUrl,
+			url:     testURL,
 			headers: {"header1": "123", "header2": "456"},
 			body:    '789',
 		})
 
 		// with custom content-type header
 		const test2 = $http.send({
-			url: testUrl,
+			url: testURL,
 			headers: {"content-type": "text/plain"},
 		})
 
@@ -1261,9 +1507,16 @@ func TestHttpClientBindsSend(t *testing.T) {
 		const formData = new FormData()
 		formData.append("title", "123")
 		const test3 = $http.send({
-			url: testUrl,
+			url: testURL,
 			body: formData,
 			headers: {"content-type": "text/plain"}, // should be ignored
+		})
+
+		// raw body response field check
+		const test4 = $http.send({
+			method: "post",
+			url:    testURL,
+			body:   'test',
 		})
 
 		const scenarios = [
@@ -1277,7 +1530,6 @@ func TestHttpClientBindsSend(t *testing.T) {
 				"json.method":               "POST",
 				"json.headers.header1":      "123",
 				"json.headers.header2":      "456",
-				"json.headers.content_type": "application/json", // default
 				"json.body":                 "789",
 			}],
 			[test2, {
@@ -1299,6 +1551,13 @@ func TestHttpClientBindsSend(t *testing.T) {
 					"multipart/form-data; boundary="
 				],
 			}],
+			[test4, {
+				"statusCode":              "200",
+				"headers.X-Custom.0":      "custom_header",
+				"cookies.sessionId.value": "123456",
+				// {"body":"test","headers":{"accept_encoding":"gzip","content_length":"4","user_agent":"Go-http-client/1.1"},"method":"POST"}
+				"body": [123,34,98,111,100,121,34,58,34,116,101,115,116,34,44,34,104,101,97,100,101,114,115,34,58,123,34,97,99,99,101,112,116,95,101,110,99,111,100,105,110,103,34,58,34,103,122,105,112,34,44,34,99,111,110,116,101,110,116,95,108,101,110,103,116,104,34,58,34,52,34,44,34,117,115,101,114,95,97,103,101,110,116,34,58,34,71,111,45,104,116,116,112,45,99,108,105,101,110,116,47,49,46,49,34,125,44,34,109,101,116,104,111,100,34,58,34,80,79,83,84,34,125],
+			}],
 		]
 
 		for (let scenario of scenarios) {
@@ -1312,13 +1571,13 @@ func TestHttpClientBindsSend(t *testing.T) {
 					// check for partial match(es)
 					for (let exp of expectation) {
 						if (!value.includes(exp)) {
-							throw new Error('Expected ' + key + ' to contain ' + exp + ', got: ' + result.raw);
+							throw new Error('Expected ' + key + ' to contain ' + exp + ', got: ' + toString(result.body));
 						}
 					}
 				} else {
 					// check for direct match
 					if (value != expectation) {
-						throw new Error('Expected ' + key + ' ' + expectation + ', got: ' + result.raw);
+						throw new Error('Expected ' + key + ' ' + expectation + ', got: ' + toString(result.body));
 					}
 				}
 			}
@@ -1334,9 +1593,17 @@ func TestCronBindsCount(t *testing.T) {
 	defer app.Cleanup()
 
 	vm := goja.New()
-	cronBinds(app, vm, nil)
+
+	pool := newPool(1, func() *goja.Runtime { return goja.New() })
+
+	cronBinds(app, vm, pool)
 
 	testBindsCount(vm, "this", 2, t)
+
+	pool.run(func(poolVM *goja.Runtime) error {
+		testBindsCount(poolVM, "this", 2, t)
+		return nil
+	})
 }
 
 func TestHooksBindsCount(t *testing.T) {
@@ -1346,7 +1613,7 @@ func TestHooksBindsCount(t *testing.T) {
 	vm := goja.New()
 	hooksBinds(app, vm, nil)
 
-	testBindsCount(vm, "this", 88, t)
+	testBindsCount(vm, "this", 83, t)
 }
 
 func TestHooksBinds(t *testing.T) {
@@ -1359,7 +1626,7 @@ func TestHooksBinds(t *testing.T) {
 
 	vmFactory := func() *goja.Runtime {
 		vm := goja.New()
-		baseBinds(vm)
+		BindCore(vm)
 		vm.Set("$app", app)
 		vm.Set("result", result)
 		return vm
@@ -1371,35 +1638,41 @@ func TestHooksBinds(t *testing.T) {
 	hooksBinds(app, vm, pool)
 
 	_, err := vm.RunString(`
-		onModelBeforeUpdate((e) => {
+		onModelUpdate((e) => {
 			result.called++;
+			e.next()
 		}, "demo1")
 
-		onModelBeforeUpdate((e) => {
+		onModelUpdate((e) => {
 			throw new Error("example");
 		}, "demo1")
 
-		onModelBeforeUpdate((e) => {
+		onModelUpdate((e) => {
 			result.called++;
+			e.next();
 		}, "demo2")
 
-		onModelBeforeUpdate((e) => {
+		onModelUpdate((e) => {
 			result.called++;
+			e.next()
 		}, "demo2")
 
-		onModelBeforeUpdate((e) => {
-			return false
+		onModelUpdate((e) => {
+			// stop propagation
 		}, "demo2")
 
-		onModelBeforeUpdate((e) => {
+		onModelUpdate((e) => {
 			result.called++;
+			e.next();
 		}, "demo2")
 
-		onAfterBootstrap(() => {
+		onBootstrap((e) => {
+			e.next()
+
 			// check hooks propagation and tags filtering
-			const recordA = $app.dao().findFirstRecordByFilter("demo2", "1=1")
+			const recordA = $app.findFirstRecordByFilter("demo2", "1=1")
 			recordA.set("title", "update")
-			$app.dao().saveRecord(recordA)
+			$app.save(recordA)
 			if (result.called != 2) {
 				throw new Error("Expected result.called to be 2, got " + result.called)
 			}
@@ -1410,9 +1683,9 @@ func TestHooksBinds(t *testing.T) {
 			// check error handling
 			let hasErr = false
 			try {
-				const recordB = $app.dao().findFirstRecordByFilter("demo1", "1=1")
+				const recordB = $app.findFirstRecordByFilter("demo1", "1=1")
 				recordB.set("text", "update")
-				$app.dao().saveRecord(recordB)
+				$app.save(recordB)
 			} catch (err) {
 				hasErr = true
 			}
@@ -1431,6 +1704,47 @@ func TestHooksBinds(t *testing.T) {
 	}
 }
 
+func TestHooksExceptionUnwrapping(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	goErr := errors.New("test")
+
+	vmFactory := func() *goja.Runtime {
+		vm := goja.New()
+		BindCore(vm)
+		vm.Set("$app", app)
+		vm.Set("goErr", goErr)
+		return vm
+	}
+
+	pool := newPool(1, vmFactory)
+
+	vm := vmFactory()
+	hooksBinds(app, vm, pool)
+
+	_, err := vm.RunString(`
+		onModelUpdate((e) => {
+			throw goErr
+		}, "demo1")
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record, err := app.FindFirstRecordByFilter("demo1", "1=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record.Set("text", "update")
+
+	err = app.Save(record)
+	if !errors.Is(err, goErr) {
+		t.Fatalf("Expected goError, got %v", err)
+	}
+}
+
 func TestRouterBindsCount(t *testing.T) {
 	app, _ := tests.NewTestApp()
 	defer app.Cleanup()
@@ -1438,7 +1752,7 @@ func TestRouterBindsCount(t *testing.T) {
 	vm := goja.New()
 	routerBinds(app, vm, nil)
 
-	testBindsCount(vm, "this", 3, t)
+	testBindsCount(vm, "this", 2, t)
 }
 
 func TestRouterBinds(t *testing.T) {
@@ -1446,14 +1760,14 @@ func TestRouterBinds(t *testing.T) {
 	defer app.Cleanup()
 
 	result := &struct {
-		AddCount int
-		UseCount int
-		PreCount int
+		RouteMiddlewareCalls  int
+		GlobalMiddlewareCalls int
 	}{}
 
 	vmFactory := func() *goja.Runtime {
 		vm := goja.New()
-		baseBinds(vm)
+		BindCore(vm)
+		BindApis(vm)
 		vm.Set("$app", app)
 		vm.Set("result", result)
 		return vm
@@ -1466,81 +1780,91 @@ func TestRouterBinds(t *testing.T) {
 
 	_, err := vm.RunString(`
 		routerAdd("GET", "/test", (e) => {
-			result.addCount++;
-		}, (next) => {
-			return (c) => {
-				result.addCount++;
-
-				return next(c);
-			}
+			result.routeMiddlewareCalls++;
+		}, (e) => {
+			result.routeMiddlewareCalls++;
+			return e.next();
 		})
 
-		routerUse((next) => {
-			return (c) => {
-				result.useCount++;
-
-				return next(c)
-			}
+		// Promise is not technically supported as return result
+		// but we try to resolve it at least for thrown errors
+		routerAdd("GET", "/error", async (e) => {
+			throw new ApiError(456, 'test', null)
 		})
 
-		routerPre((next) => {
-			return (c) => {
-				result.preCount++;
+		routerUse((e) => {
+			result.globalMiddlewareCalls++;
 
-				return next(c)
-			}
+			return e.next();
 		})
 	`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	e, err := apis.InitApi(app)
+	pbRouter, err := apis.NewRouter(app)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	serveEvent := &core.ServeEvent{
-		App:    app,
-		Router: e,
-	}
-	if err := app.OnBeforeServe().Trigger(serveEvent); err != nil {
+	serveEvent := new(core.ServeEvent)
+	serveEvent.App = app
+	serveEvent.Router = pbRouter
+	if err = app.OnServe().Trigger(serveEvent); err != nil {
 		t.Fatal(err)
 	}
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
-	e.ServeHTTP(rec, req)
-
-	if result.AddCount != 2 {
-		t.Fatalf("Expected AddCount %d, got %d", 2, result.AddCount)
+	mux, err := serveEvent.Router.BuildMux()
+	if err != nil {
+		t.Fatalf("Failed to build router mux: %v", err)
 	}
 
-	if result.UseCount != 1 {
-		t.Fatalf("Expected UseCount %d, got %d", 1, result.UseCount)
+	scenarios := []struct {
+		method                        string
+		path                          string
+		expectedRouteMiddlewareCalls  int
+		expectedGlobalMiddlewareCalls int
+		expectedCode                  int
+	}{
+		{"GET", "/test", 2, 1, 200},
+		{"GET", "/error", 0, 1, 456},
 	}
 
-	if result.PreCount != 1 {
-		t.Fatalf("Expected PreCount %d, got %d", 1, result.PreCount)
+	for _, s := range scenarios {
+		t.Run(s.method+" "+s.path, func(t *testing.T) {
+			// reset
+			result.RouteMiddlewareCalls = 0
+			result.GlobalMiddlewareCalls = 0
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(s.method, s.path, nil)
+			mux.ServeHTTP(rec, req)
+
+			if result.RouteMiddlewareCalls != s.expectedRouteMiddlewareCalls {
+				t.Fatalf("Expected RouteMiddlewareCalls %d, got %d", s.expectedRouteMiddlewareCalls, result.RouteMiddlewareCalls)
+			}
+
+			if result.GlobalMiddlewareCalls != s.expectedGlobalMiddlewareCalls {
+				t.Fatalf("Expected GlobalMiddlewareCalls %d, got %d", s.expectedGlobalMiddlewareCalls, result.GlobalMiddlewareCalls)
+			}
+
+			if rec.Code != s.expectedCode {
+				t.Fatalf("Expected status code %d, got %d", s.expectedCode, rec.Code)
+			}
+		})
 	}
 }
 
-func TestFilepathBindsCount(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindFilepathCount(t *testing.T) {
 	vm := goja.New()
-	filepathBinds(vm)
+	BindFilepath(vm)
 
 	testBindsCount(vm, "$filepath", 15, t)
 }
 
-func TestOsBindsCount(t *testing.T) {
-	app, _ := tests.NewTestApp()
-	defer app.Cleanup()
-
+func TestBindOSCount(t *testing.T) {
 	vm := goja.New()
-	osBinds(vm)
+	BindOS(vm)
 
-	testBindsCount(vm, "$os", 17, t)
+	testBindsCount(vm, "$os", 20, t)
 }

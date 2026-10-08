@@ -2,11 +2,14 @@ package logger
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
 	"time"
+
+	validation "github.com/pocketbase/ozzo-validation/v4"
 )
 
 func TestNewBatchHandlerPanic(t *testing.T) {
@@ -181,11 +184,8 @@ func TestBatchHandlerHandle(t *testing.T) {
 		BeforeAddFunc: func(_ context.Context, log *Log) bool {
 			beforeLogs = append(beforeLogs, log)
 
-			if log.Message == "test2" {
-				return false // skip test2 log
-			}
-
-			return true
+			// skip test2 log
+			return log.Message != "test2"
 		},
 		WriteFunc: func(_ context.Context, logs []*Log) error {
 			writeLogs = logs
@@ -283,20 +283,51 @@ func TestBatchHandlerAttrsFormat(t *testing.T) {
 	h1.Handle(ctx, record)
 	h2.Handle(ctx, record)
 
+	// errors serialization checks
+	errorsRecord := slog.NewRecord(time.Now(), slog.LevelError, "details", 0)
+	errorsRecord.Add("validation.Errors", validation.Errors{
+		"a": validation.NewError("validation_code", "validation_message"),
+		"b": errors.New("plain"),
+	})
+	errorsRecord.Add("wrapped_validation.Errors", fmt.Errorf("wrapped: %w", validation.Errors{
+		"a": validation.NewError("validation_code", "validation_message"),
+		"b": errors.New("plain"),
+	}))
+	errorsRecord.Add("map[string]any", map[string]any{
+		"a": validation.NewError("validation_code", "validation_message"),
+		"b": errors.New("plain"),
+		"c": "test_any",
+		"d": map[string]any{
+			"nestedA": validation.NewError("nested_code", "nested_message"),
+			"nestedB": errors.New("nested_plain"),
+		},
+	})
+	errorsRecord.Add("map[string]error", map[string]error{
+		"a": validation.NewError("validation_code", "validation_message"),
+		"b": errors.New("plain"),
+	})
+	errorsRecord.Add("map[string]validation.Error", map[string]validation.Error{
+		"a": validation.NewError("validation_code", "validation_message"),
+		"b": nil,
+	})
+	errorsRecord.Add("plain_error", errors.New("plain"))
+	h0.Handle(ctx, errorsRecord)
+
 	expected := []string{
 		`{"name":"test"}`,
 		`{"a":1,"b":"123","name":"test"}`,
 		`{"a":1,"b":"123","sub":{"c":3,"d":{"d.1":1},"e":"example error","name":"test"}}`,
+		`{"map[string]any":{"a":"validation_message","b":"plain","c":"test_any","d":{"nestedA":"nested_message","nestedB":"nested_plain"}},"map[string]error":{"a":"validation_message","b":"plain"},"map[string]validation.Error":{"a":"validation_message","b":null},"plain_error":"plain","validation.Errors":{"a":"validation_message","b":"plain"},"wrapped_validation.Errors":{"data":{"a":"validation_message","b":"plain"},"raw":"wrapped: a: validation_message; b: plain."}}`,
 	}
 
 	if len(beforeLogs) != len(expected) {
-		t.Fatalf("Expected %d logs, got %d", len(beforeLogs), len(expected))
+		t.Fatalf("Expected %d logs, got %d", len(expected), len(beforeLogs))
 	}
 
 	for i, data := range expected {
 		t.Run(fmt.Sprintf("log handler %d", i), func(t *testing.T) {
 			log := beforeLogs[i]
-			raw, _ := log.Data.MarshalJSON()
+			raw, _ := json.Marshal(log.Data, json.Deterministic(true))
 			if string(raw) != data {
 				t.Fatalf("Expected \n%s \ngot \n%s", data, raw)
 			}

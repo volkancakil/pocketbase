@@ -1,8 +1,11 @@
 package cron
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
+	"slices"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -98,6 +101,11 @@ func TestCronAddAndRemove(t *testing.T) {
 	// try to remove non-existing (should be no-op)
 	c.Remove("missing")
 
+	indexedJobs := make(map[string]*Job, len(c.jobs))
+	for _, j := range c.jobs {
+		indexedJobs[j.Id()] = j
+	}
+
 	// check job keys
 	{
 		expectedKeys := []string{"test3", "test2", "test5"}
@@ -107,7 +115,7 @@ func TestCronAddAndRemove(t *testing.T) {
 		}
 
 		for _, k := range expectedKeys {
-			if c.jobs[k] == nil {
+			if indexedJobs[k] == nil {
 				t.Fatalf("Expected job with key %s, got nil", k)
 			}
 		}
@@ -121,7 +129,7 @@ func TestCronAddAndRemove(t *testing.T) {
 			"test5": `{"minutes":{"1":{}},"hours":{"2":{}},"days":{"3":{}},"months":{"4":{}},"daysOfWeek":{"5":{}}}`,
 		}
 		for k, v := range expectedSchedules {
-			raw, err := json.Marshal(c.jobs[k].schedule)
+			raw, err := json.Marshal(indexedJobs[k].schedule, json.Deterministic(true))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -148,7 +156,7 @@ func TestCronMustAdd(t *testing.T) {
 
 	c.MustAdd("test2", "* * * * *", func() {})
 
-	if _, ok := c.jobs["test2"]; !ok {
+	if !slices.ContainsFunc(c.jobs, func(j *Job) bool { return j.Id() == "test2" }) {
 		t.Fatal("Couldn't find job test2")
 	}
 }
@@ -208,56 +216,104 @@ func TestCronTotal(t *testing.T) {
 	}
 }
 
-func TestCronStartStop(t *testing.T) {
+func TestCronJobs(t *testing.T) {
 	t.Parallel()
-
-	test1 := 0
-	test2 := 0
 
 	c := New()
 
-	c.SetInterval(500 * time.Millisecond)
+	calls := ""
 
-	c.Add("test1", "* * * * *", func() {
-		test1++
+	if err := c.Add("a", "1 * * * *", func() { calls += "a" }); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Add("b", "2 * * * *", func() { calls += "b" }); err != nil {
+		t.Fatal(err)
+	}
+
+	// overwrite
+	if err := c.Add("b", "3 * * * *", func() { calls += "b" }); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs := c.Jobs()
+
+	if len(jobs) != 2 {
+		t.Fatalf("Expected 2 jobs, got %v", len(jobs))
+	}
+
+	for _, j := range jobs {
+		j.Run()
+	}
+
+	expectedCalls := "ab"
+	if calls != expectedCalls {
+		t.Fatalf("Expected %q calls, got %q", expectedCalls, calls)
+	}
+}
+
+func TestCronStartStop(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+
+		test1 := 0
+		test2 := 0
+
+		c := New()
+
+		c.SetInterval(250 * time.Millisecond)
+
+		c.Add("test1", "* * * * *", func() {
+			mu.Lock()
+			defer mu.Unlock()
+			test1++
+		})
+
+		c.Add("test2", "* * * * *", func() {
+			mu.Lock()
+			defer mu.Unlock()
+			test2++
+		})
+
+		// call twice Start to check if the previous ticker will be reseted
+		c.Start()
+		c.Start()
+
+		synctest.Sleep(500 * time.Millisecond)
+
+		// call twice Stop to ensure that the second stop is no-op
+		c.Stop()
+		c.Stop()
+
+		expectedCalls := 2
+
+		mu.Lock()
+		if test1 != expectedCalls {
+			t.Fatalf("Expected %d test1, got %d", expectedCalls, test1)
+		}
+		if test2 != expectedCalls {
+			t.Fatalf("Expected %d test2, got %d", expectedCalls, test2)
+		}
+		mu.Unlock()
+
+		// resume for 1 seconds
+		c.Start()
+
+		synctest.Sleep(1000 * time.Millisecond)
+
+		c.Stop()
+
+		expectedCalls += 4
+
+		mu.Lock()
+		if test1 != expectedCalls {
+			t.Fatalf("Expected %d test1, got %d", expectedCalls, test1)
+		}
+		if test2 != expectedCalls {
+			t.Fatalf("Expected %d test2, got %d", expectedCalls, test2)
+		}
+		mu.Unlock()
 	})
-
-	c.Add("test2", "* * * * *", func() {
-		test2++
-	})
-
-	expectedCalls := 2
-
-	// call twice Start to check if the previous ticker will be reseted
-	c.Start()
-	c.Start()
-
-	time.Sleep(1 * time.Second)
-
-	// call twice Stop to ensure that the second stop is no-op
-	c.Stop()
-	c.Stop()
-
-	if test1 != expectedCalls {
-		t.Fatalf("Expected %d test1, got %d", expectedCalls, test1)
-	}
-	if test2 != expectedCalls {
-		t.Fatalf("Expected %d test2, got %d", expectedCalls, test2)
-	}
-
-	// resume for 2 seconds
-	c.Start()
-
-	time.Sleep(2 * time.Second)
-
-	c.Stop()
-
-	expectedCalls += 4
-
-	if test1 != expectedCalls {
-		t.Fatalf("Expected %d test1, got %d", expectedCalls, test1)
-	}
-	if test2 != expectedCalls {
-		t.Fatalf("Expected %d test2, got %d", expectedCalls, test2)
-	}
 }

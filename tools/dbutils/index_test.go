@@ -2,8 +2,8 @@ package dbutils_test
 
 import (
 	"bytes"
-	"encoding/json"
-	"fmt"
+	"encoding/json/v2"
+	"strings"
 	"testing"
 
 	"github.com/pocketbase/pocketbase/tools/dbutils"
@@ -11,17 +11,28 @@ import (
 
 func TestParseIndex(t *testing.T) {
 	scenarios := []struct {
+		name     string
 		index    string
 		expected dbutils.Index
 	}{
-		// invalid
 		{
+			"invalid",
 			`invalid`,
 			dbutils.Index{},
 		},
-		// simple (multiple spaces between the table and columns list)
 		{
-			`create index indexname on tablename   (col1)`,
+			"no names",
+			`create index on ()`,
+			dbutils.Index{},
+		},
+		{
+			"invalid index name",
+			`create index a.b.c on ()`,
+			dbutils.Index{},
+		},
+		{
+			"simple (multiple spaces as prefix, suffix, between the table and columns list)",
+			`  create index indexname on tablename   (col1)  `,
 			dbutils.Index{
 				IndexName: "indexname",
 				TableName: "tablename",
@@ -30,8 +41,8 @@ func TestParseIndex(t *testing.T) {
 				},
 			},
 		},
-		// simple (no space between the table and the columns list)
 		{
+			"simple (no space between the table and the columns list)",
 			`create index indexname on tablename(col1)`,
 			dbutils.Index{
 				IndexName: "indexname",
@@ -41,15 +52,15 @@ func TestParseIndex(t *testing.T) {
 				},
 			},
 		},
-		// all fields
 		{
+			"all fields",
 			`CREATE UNIQUE INDEX IF NOT EXISTS "schemaname".[indexname] on 'tablename' (
 				col0,
 				` + "`" + `col1` + "`" + `,
-				json_extract("col2", "$.a") asc,
+				json_extract("col2_multiline",` + "\n" + ` "$.a") asc,
 				"col3" collate NOCASE,
 				"col4" collate RTRIM desc
-			) where test = 1`,
+			) where cast(test1 as ` + "\n" + `int) = 1 and test2 != ''`,
 			dbutils.Index{
 				Unique:     true,
 				Optional:   true,
@@ -59,22 +70,22 @@ func TestParseIndex(t *testing.T) {
 				Columns: []dbutils.IndexColumn{
 					{Name: "col0"},
 					{Name: "col1"},
-					{Name: `json_extract("col2", "$.a")`, Sort: "ASC"},
+					{Name: `json_extract("col2_multiline",` + "\n" + ` "$.a")`, Sort: "ASC"},
 					{Name: `col3`, Collate: "NOCASE"},
 					{Name: `col4`, Collate: "RTRIM", Sort: "DESC"},
 				},
-				Where: "test = 1",
+				Where: "cast(test1 as \nint) = 1 and test2 != ''",
 			},
 		},
 	}
 
-	for i, s := range scenarios {
-		t.Run(fmt.Sprintf("scenario_%d", i), func(t *testing.T) {
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
 			result := dbutils.ParseIndex(s.index)
 
 			resultRaw, err := json.Marshal(result)
 			if err != nil {
-				t.Fatalf("Faild to marshalize parse result: %v", err)
+				t.Fatalf("Failed to marshalize parse result: %v", err)
 			}
 
 			expectedRaw, err := json.Marshal(s.expected)
@@ -308,6 +319,96 @@ func TestHasSingleColumnUniqueIndex(t *testing.T) {
 			result := dbutils.HasSingleColumnUniqueIndex(s.column, s.indexes)
 			if result != s.expected {
 				t.Fatalf("Expected %v got %v", s.expected, result)
+			}
+		})
+	}
+}
+
+func TestFindSingleColumnUniqueIndex(t *testing.T) {
+	scenarios := []struct {
+		name     string
+		column   string
+		indexes  []string
+		expected bool
+	}{
+		{
+			"empty indexes",
+			"test",
+			nil,
+			false,
+		},
+		{
+			"empty column",
+			"",
+			[]string{
+				"CREATE UNIQUE INDEX `index1` ON `example` (`test`)",
+			},
+			false,
+		},
+		{
+			"mismatched column",
+			"test",
+			[]string{
+				"CREATE UNIQUE INDEX `index1` ON `example` (`test2`)",
+			},
+			false,
+		},
+		{
+			"non unique index",
+			"test",
+			[]string{
+				"CREATE INDEX `index1` ON `example` (`test`)",
+			},
+			false,
+		},
+		{
+			"matching columnd and unique index",
+			"test",
+			[]string{
+				"CREATE UNIQUE INDEX `index1` ON `example` (`test`)",
+			},
+			true,
+		},
+		{
+			"multiple columns",
+			"test",
+			[]string{
+				"CREATE UNIQUE INDEX `index1` ON `example` (`test`, `test2`)",
+			},
+			false,
+		},
+		{
+			"multiple indexes",
+			"test",
+			[]string{
+				"CREATE UNIQUE INDEX `index1` ON `example` (`test`, `test2`)",
+				"CREATE UNIQUE INDEX `index2` ON `example` (`test`)",
+			},
+			true,
+		},
+		{
+			"partial unique index",
+			"test",
+			[]string{
+				"CREATE UNIQUE INDEX `index` ON `example` (`test`) where test != ''",
+			},
+			true,
+		},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			index, exists := dbutils.FindSingleColumnUniqueIndex(s.indexes, s.column)
+			if exists != s.expected {
+				t.Fatalf("Expected exists %v got %v", s.expected, exists)
+			}
+
+			if !exists && len(index.Columns) > 0 {
+				t.Fatal("Expected index.Columns to be empty")
+			}
+
+			if exists && !strings.EqualFold(index.Columns[0].Name, s.column) {
+				t.Fatalf("Expected to find column %q in %v", s.column, index)
 			}
 		})
 	}
